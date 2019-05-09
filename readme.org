@@ -1,0 +1,310 @@
+#+TITLE: Arch on macOS Survival Guide
+#+AUTHOR: Andrew Jarrett
+#+EMAIL:ahrjarrett@gmail.com
+#+DATE: 05/07/2019
+
+
+* Dual-boot installation
+
+Install steps:
+
+1. Firmware updates: It always helps to start from a clean, backed up, and up-to-date install of OS X.
+2. Partition: Resizing or deleting the OS X partition to create partitions for Arch Linux.
+3. Setup bootloader: Making sure that the new partition is bootable.
+4. Install Arch Linux: Actually installing Arch Linux.
+5. Post-installation: MacBook-specific configuration.
+
+*Note:* Before doing all that, make sure you turn on your Mac starup chime (if pre-2016) -- this is useful for diagnostic purposes and for some reason can't be changed later:
+
+~sudo nvram BootAudio=%01~
+
+** Boot up from your USB (fresh OS X version & erased drives recommended)
+   - Left option key while booting
+   - Choose USB drive
+   - If on retina, run ~setfont sun12x22~ so you can actually read the shell
+   - You are now running Arch "live" from your USB
+
+** Test internet
+   - ~dhcpcd~ to get an IP address from router
+   - ~ping -c 3 www.google~ to make sure you get 3 packets; internet is working
+     
+** Set up clock or whatever
+   - ~timedatectl set-ntp true~
+
+   
+   
+** Install:
+
+*** 1. Firmware updates
+
+Wipe her clean
+
+*** 2. Partition macOS
+
+*Partition Type:* Apple uses the GUID Partition Table (GPT), and we’re going to keep that partition table
+
+1. _Make sure FileVault2 is off_
+2. _Then, make sure FileVault2 is off_
+3. Run disk utility GUI
+   - Make sure you "Show all devices" if SSD drive isn't there (otherwise you'll probably be looking at other partitions)
+   - Create a partition; I did 50gb for macOS, 200gb for Arch, and chose Journaled (not APFS) as the drive type, as I was having issues with memory being overallocated
+   - If you chose Journaled, make sure you disable journaling, as Linux doesn't fully support it yet
+
+*** Install refind to manage dual boot
+
+Disable SIP services in Mojave:
+1. Boot in recovery mode
+2. Open terminal, run:
+   - ~csrutil disable~
+   - ~csrutil enable~
+
+   
+*** 3. Boot from USB
+
+Hold down Alt on bootup to boot from USB
+Log into Archiso
+
+*** 4. Initial arch config
+
+1. Set font: ~setfont sun12x22~
+2. Set up wifi (see 3rd article in resources section below) - key is ~wifi-menu~ command
+3. Set up clock ~timedatectl set-ntp true~
+
+
+*** 5. Partition Arch
+
+#+BEGIN_QUOTE
+This lists the existing partitions. If you created two partitions when preparing the MacBook, you should see a partition with a Type of Apple HFS/HFS+ with a size that matches the size you set aside for Arch. In my case this was /dev/sda5. All the partitioning commands below will use /dev/sda5, you should substitute the designation for your drive.
+
+Lets use cgdisk to view the partition table on the attached devices: Replace the Y with the drive you’ll be using to install Arch Linux.
+#+END_QUOTE
+
+1. Get drive mapping schema ~fdisk -l~, find "App HFS/HFS+" drive with size you partitioned for Arch (=/dev/sda4= for me)
+2. *Here's where it deviates from the guide below (#2 resource):*
+   + ~fdisk /dev/sda4~
+   + delete any existing partitions on HFS/+ drive
+   + create 1 partition:
+     1) Linux LVM
+        * primary (default)
+        * 4 (default)
+        * 1st sector
+        * -128M  -- gives 128Mb room
+     # 2) =swap=
+     #    * primary
+     #    * 2
+     #    * 1st sector
+     #    * swap amount (150% of RAM?) +24G
+     # 3) =/=
+     #    * primary
+     #    * 3
+     #    * 3rd sector
+     #    * at _least_ +15G, if not +25G (binaries/executables installed here)
+     # 4) home
+     #    * primary (defaults to =e=)
+     #    * 4
+     #    * 1st sector
+     #    * leave blank and it will default to all the remaining space
+
+   + ~t~ to configure partition to Linux LVM
+   + ~w~ to write!
+
+
+*** 6. Drive Encryption, LVM, Make filesystems
+
+Using “LVM on LUKS”S encryption for =/dev/sda4=, LVM
+
+**** Encryption
+
+[[https://wiki.archlinux.org/index.php/Dm-crypt/Device_encryption#Encryption_options_for_LUKS_mode][Full list of encryption options]]
+
+I went with:
+
+#+BEGIN_SRC shell
+  cryptsetup --cipher aes-xts-plain64 \
+    --key-size 512 \
+    --hash sha256 \
+    --iter-time 3000 \
+    --use-random \
+    --verify-passphrase \
+    luksFormat /dev/sda5
+#+END_SRC
+
+**** LVM
+
+First, let’s open up our encrypted partition:
+
+
+
+1. map our encrypted device (/dev/sda4 in my case) to =/dev/mapper/lvm=:
+   - ~cryptsetup luksOpen /dev/sda4 lvm~
+
+2. Create the physical volume in our LVM drive:
+   - ~pvcreate /dev/mapper/lvm~
+
+3. Now create the volume with the name *vgcrypt* (name arbitrary):
+   - ~vgcreate vgcrypt /dev/mapper/lvm~
+
+4. Create root partition on vgcrypt volume:
+   - ~lvcreate --size 32G --name root vgcrypt~
+
+5. Create swap partition on vgcrypt volume (might be unnecessary):
+   - ~lvcreate --size 16G --name lvswap vgcrypt~
+   - Configure swap partition:
+     * Formatting device with SWAP format:
+     * ~mkswap /dev/vgcrypt/lvswap~
+     * Enable the extended logical volume swap:
+     * ~swapon -v /dev/vgcrypt/lvswap~
+     * Add the following entry to the =/etc/fstab= file:
+     * ~/dev/vgcrypt/lvswap swap swap defaults 0 0~
+     * Verify the Swap space by ‘free’ command or ‘cat /proc/swaps’ command:
+     * ~free~ or ~cat /proc/swaps~
+
+6. Use of the rest of =/dev/sda4= for home partition:
+   - ~lvcreate --extents +100%FREE --name home vgcrypt~
+     
+*Note:* Our disks are no longer under the dev folder, they are now mapped to:
+
+=/dev/mapper/vgcrypt-root=
+=/dev/mapper/vgcrypt-home=
+=/dev/mapper/vgcrypt-swap=
+
+ 
+**** Make filesystems & mount drives
+
+(we'll also create our boot drive in this section.)
+
+root & home will have the ext4 type (standard):
+
+  #+BEGIN_SRC shell
+  mkfs.ext4 /dev/mapper/vgcrypt-root
+  mkfs.ext4 /dev/mapper/vgcrypt-home
+  #+END_SRC
+
+mount root & home:
+
+#+BEGIN_SRC shell
+  mount /dev/mapper/vgcrypt-root /mnt
+  mkdir -p /mnt/home
+  mount /dev/mapper/vgcrypt-home /mnt/home
+#+END_SRC
+
+now, mount the boot partition (sda1, 200Mb in my case) so our bootable initramfs can be written to boot drive:
+
+  #+BEGIN_SRC shell
+  mkdir -p /mnt/boot
+  mount /dev/sda1 /mnt/boot
+  #+END_SRC
+
+
+  
+** Finally, actually install Arch
+
+~pacstrap -i /mnt base base-devel vim terminus-font~
+
+
+** Before rebooting, fstab
+
+- need to tell the system where we put the filesystems
+- using labels instead of uuids for disks (a little unusual) bc disks are encrypted
+
+genfstab -L -p /mnt >> /mnt/etc/fstab
+cat /mnt/etc/fstab
+
+- On Macbrook Pro, add =discard= to that file for improved speed, so it looks like this:
+
+
+#+BEGIN_SRC 
+/dev/mapper/vgcrypt-root    /           ext4   discard,rw,relatime,data=ordered    0 1
+
+/dev/mapper/vgcrypt-home    /home       ext4   discard,rw,relatime,data=ordered    0 2
+#+END_SRC
+
+
+
+* Configuration
+
+first change root into our system:
+
+~arch-chroot /mnt /bin/bash~
+
+** Locale
+
+in =/etc/local.gen= do:
+
+#+BEGIN_SRC shell
+en_US.UTF-8 UTF-8
+en_US ISO-8859-1
+#+END_SRC
+
+and generate it with:
+~locale-gen~
+
+english utf-8 default:
+~echo LANG=en_US.UTF-8 > /etc/locale.conf~
+
+
+** Configure wifi on boot
+
+- grab device name (starts w/ "w")
+- ~ip link~
+- turn it on
+- ~ip link set wlp3s0 up~
+
+
+
+** Resources
+
+- [[https://0xadada.pub/2016/03/05/install-encrypted-arch-linux-on-apple-macbook-pro/#partition-the-hard-drive][main guide i followed: setting up arch on os x]]
+- [[https://wiki.archlinux.org/index.php/Mac][more in depth docs]]
+- [[http://www.linuxandubuntu.com/home/how-to-setup-a-wifi-in-arch-linux-using-terminal][setting up wifi from archiso shell]]  
+- https://gist.github.com/gretzky/149e8ebe7a8f317cc687f82c1aacf1a0
+- [[https://github.com/NoviceLive/unish/blob/master/doc/arch-install.sh#L127][shell script to set up and configure SWAP partition real easy]]
+
+Videos
+- https://www.youtube.com/watch?v=-Dqy5cGpHfw (ehh)
+
+  
+** Wifi
+
+Using NetworkManager, here's how you connect:
+
+~nmcli device wifi connect -a~
+
+The -a flag "asks" you for the rest of its arguments
+
+
+** OS X Stuff
+
+*** Screen brightness
+
+https://github.com/haikarainen/light
+
+| light       | get screen brightness |
+| light -U 10 | decrease by 10%       |
+| light -A 10 | increase by 10%       |
+
+Any issues, make it verbose with ~-v 3~ flag
+
+** Shell commands
+
+
+| shell cmd                | effect                                                               |
+|--------------------------+----------------------------------------------------------------------|
+| dhcpcd                   | get an IP address from your router:                                  |
+| timedatectl set-ntp true | set up clock                                                         |
+| setfont sun12x22         | set system (shell) font                                              |
+
+
+| arch partition cmds | effect                                                             |
+|---------------------+--------------------------------------------------------------------|
+| fdisk -l            | see drive mapping scheme                                           |
+| cgdisk /dev/sdY     | view partition table on attached device (swap =Y= w/ drive target) |
+| lsblk               | list block devices (e.g., USB drives)                              |
+|                     |                                                                    |
+
+| macOS partition cmds                             | effect                                    |
+|--------------------------------------------------+-------------------------------------------|
+| diskutil info /dev/disk0s3 \vert grep -i journal | check if drive is journaled (bad)         |
+| df -h                                            | list mounted partitions                   |
+| csrutil disable/enable                           | disable SIP in recovery mode (for refind) |
+
